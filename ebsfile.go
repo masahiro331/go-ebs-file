@@ -3,8 +3,9 @@ package ebsfile
 import (
 	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"io"
+
+	"github.com/aws/aws-sdk-go/aws/session"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -54,8 +55,17 @@ func Open(snapID string, ctx context.Context, cache Cache, e EBS) (*io.SectionRe
 	for _, block := range output.Blocks {
 		t[*block.BlockIndex] = *block.BlockToken
 	}
+	ebs.ListChangedBlocksInput{}
 
-	f := &File{size: *output.VolumeSize << 30, snapshotID: snapID, blockSize: *output.BlockSize, blockTable: t, cache: cache, ebsclient: e, ctx: ctx}
+	f := &File{
+		size:       *output.VolumeSize << 30,
+		snapshotID: snapID,
+		blockSize:  *output.BlockSize,
+		blockTable: t,
+		cache:      cache,
+		ebsclient:  e,
+		ctx:        ctx,
+	}
 	return io.NewSectionReader(f, 0, f.Size()), nil
 }
 
