@@ -40,28 +40,38 @@ func New(option Option) EBS {
 	return EBS{ebs.New(sess)}
 }
 
+func (e EBS) listSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int64]string) (*ebs.ListSnapshotBlocksOutput, map[int64]string, error) {
+	output, err := e.ListSnapshotBlocksWithContext(ctx, input)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, block := range output.Blocks {
+		table[*block.BlockIndex] = *block.BlockToken
+	}
+	if output.NextToken != nil {
+		input.NextToken = output.NextToken
+		return e.listSnapshotBlocks(ctx, input, table)
+	}
+	return output, table, nil
+}
+
 func Open(snapID string, ctx context.Context, cache Cache, e EBS) (*io.SectionReader, error) {
 	input := &ebs.ListSnapshotBlocksInput{
 		SnapshotId: &snapID,
 	}
-	output, err := e.ListSnapshotBlocksWithContext(ctx, input)
+	output, table, err := e.listSnapshotBlocks(ctx, input, make(map[int64]string))
 	if err != nil {
 		return nil, err
 	}
 	if cache == nil {
 		cache = &mockCache{}
 	}
-	t := make(map[int64]string)
-	for _, block := range output.Blocks {
-		t[*block.BlockIndex] = *block.BlockToken
-	}
-	ebs.ListChangedBlocksInput{}
 
 	f := &File{
 		size:       *output.VolumeSize << 30,
 		snapshotID: snapID,
 		blockSize:  *output.BlockSize,
-		blockTable: t,
+		blockTable: table,
 		cache:      cache,
 		ebsclient:  e,
 		ctx:        ctx,
