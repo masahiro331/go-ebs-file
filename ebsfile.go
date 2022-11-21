@@ -1,18 +1,70 @@
 package ebsfile
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-
-	"github.com/aws/aws-sdk-go/aws/session"
+	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-
+	"github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ebs"
 	"github.com/aws/aws-sdk-go/service/ebs/ebsiface"
 )
+
+type MockEBS struct {
+	ebsiface.EBSAPI
+
+	f          *os.File
+	BlockSize  *int64
+	NextToken  *string
+	VolumeSize *int64
+}
+
+func (m MockEBS) WalkSnapshotBlocks(_ context.Context, _ *ebs.ListSnapshotBlocksInput, _ map[int64]string) (*ebs.ListSnapshotBlocksOutput, map[int64]string, error) {
+	indexLen := *m.VolumeSize / *m.BlockSize
+	var blocks []*ebs.Block
+	t := make(map[int64]string)
+	for i := int64(0); i < indexLen; i++ {
+		blocks = append(blocks, &ebs.Block{BlockIndex: aws.Int64(i)})
+		t[i] = ""
+	}
+
+	return &ebs.ListSnapshotBlocksOutput{
+		Blocks:     blocks,
+		BlockSize:  m.BlockSize, // 512 KB
+		VolumeSize: m.VolumeSize,
+	}, t, nil
+}
+
+func (m MockEBS) GetSnapshotBlockWithContext(_ aws.Context, input *ebs.GetSnapshotBlockInput, _ ...request.Option) (*ebs.GetSnapshotBlockOutput, error) {
+	buf := make([]byte, *m.BlockSize)
+
+	offset := *input.BlockIndex * (*m.BlockSize)
+	n, err := m.f.ReadAt(buf, offset)
+	if err != nil {
+		return nil, err
+	}
+	return &ebs.GetSnapshotBlockOutput{
+		BlockData:  io.NopCloser(bytes.NewReader(buf)),
+		DataLength: aws.Int64(int64(n)),
+	}, nil
+}
+
+func NewMockEBS(filePath string, blockSize, volumeSize int64) EBSAPI {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil
+	}
+	return &MockEBS{
+		f:          f,
+		BlockSize:  aws.Int64(blockSize),
+		VolumeSize: aws.Int64(volumeSize),
+	}
+}
 
 type EBS struct {
 	ebsiface.EBSAPI
@@ -57,6 +109,7 @@ func (e EBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBloc
 		input.NextToken = output.NextToken
 		return e.WalkSnapshotBlocks(ctx, input, table)
 	}
+	output.VolumeSize = aws.Int64(*output.VolumeSize << 30)
 	return output, table, nil
 }
 
@@ -73,7 +126,7 @@ func Open(snapID string, ctx context.Context, cache Cache, e EBSAPI) (*io.Sectio
 	}
 
 	f := &File{
-		size:       *output.VolumeSize << 30,
+		size:       *output.VolumeSize,
 		snapshotID: snapID,
 		blockSize:  *output.BlockSize,
 		blockTable: table,
