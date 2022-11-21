@@ -18,13 +18,18 @@ type EBS struct {
 	ebsiface.EBSAPI
 }
 
+type EBSAPI interface {
+	ebsiface.EBSAPI
+	WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int64]string) (*ebs.ListSnapshotBlocksOutput, map[int64]string, error)
+}
+
 type File struct {
 	snapshotID string
 	size       int64
 	blockSize  int64
 	blockTable map[int64]string
 
-	ebsclient EBS
+	ebsclient EBSAPI
 	cache     Cache
 	ctx       context.Context
 }
@@ -35,12 +40,12 @@ type Option struct {
 	AwsRegion    string
 }
 
-func New(option Option) EBS {
+func New(option Option) *EBS {
 	sess := session.Must(getSession(option))
-	return EBS{ebs.New(sess)}
+	return &EBS{ebs.New(sess)}
 }
 
-func (e EBS) listSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int64]string) (*ebs.ListSnapshotBlocksOutput, map[int64]string, error) {
+func (e EBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int64]string) (*ebs.ListSnapshotBlocksOutput, map[int64]string, error) {
 	output, err := e.ListSnapshotBlocksWithContext(ctx, input)
 	if err != nil {
 		return nil, nil, err
@@ -50,16 +55,16 @@ func (e EBS) listSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBloc
 	}
 	if output.NextToken != nil {
 		input.NextToken = output.NextToken
-		return e.listSnapshotBlocks(ctx, input, table)
+		return e.WalkSnapshotBlocks(ctx, input, table)
 	}
 	return output, table, nil
 }
 
-func Open(snapID string, ctx context.Context, cache Cache, e EBS) (*io.SectionReader, error) {
+func Open(snapID string, ctx context.Context, cache Cache, e EBSAPI) (*io.SectionReader, error) {
 	input := &ebs.ListSnapshotBlocksInput{
 		SnapshotId: &snapID,
 	}
-	output, table, err := e.listSnapshotBlocks(ctx, input, make(map[int64]string))
+	output, table, err := e.WalkSnapshotBlocks(ctx, input, make(map[int64]string))
 	if err != nil {
 		return nil, err
 	}
