@@ -74,6 +74,10 @@ type EBSAPI interface {
 	WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error)
 }
 
+func cacheKey(n int64) string {
+	return fmt.Sprintf("ebs:%d", n)
+}
+
 type File struct {
 	snapshotID string
 	size       int64
@@ -81,7 +85,7 @@ type File struct {
 	blockTable map[int32]string
 
 	ebsclient EBSAPI
-	cache     Cache
+	cache     Cache[string, []byte]
 	ctx       context.Context
 }
 
@@ -120,7 +124,7 @@ func (e EBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBloc
 	return output, table, nil
 }
 
-func Open(snapID string, ctx context.Context, cache Cache, e EBSAPI) (*io.SectionReader, error) {
+func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBSAPI) (*io.SectionReader, error) {
 	input := &ebs.ListSnapshotBlocksInput{
 		SnapshotId: &snapID,
 	}
@@ -129,7 +133,7 @@ func Open(snapID string, ctx context.Context, cache Cache, e EBSAPI) (*io.Sectio
 		return nil, err
 	}
 	if cache == nil {
-		cache = &mockCache{}
+		cache = &mockCache[string, []byte]{}
 	}
 
 	f := &File{
@@ -155,16 +159,17 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
+	key := cacheKey(int64(index))
 	var buf []byte
-	bi, ok := f.cache.Get(cacheKey(index))
+	bi, ok := f.cache.Get(key)
 	if ok {
-		buf = bi.([]byte)
+		buf = any(bi).([]byte)
 	} else {
 		buf, err = f.read(index, token)
 		if err != nil {
 			return 0, err
 		}
-		f.cache.Add(cacheKey(index), buf)
+		f.cache.Add(key, buf)
 	}
 	if len(buf) != int(f.blockSize) {
 		return 0, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)

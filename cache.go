@@ -1,25 +1,23 @@
 package ebsfile
 
 var (
-	_ Cache = &mockCache{}
+	_ Cache[string, []byte] = &mockCache[string, []byte]{}
 )
 
-type Cache interface {
+type Cache[K string, V any] interface {
 	// Add cache data
-	Add(key, value interface{}) bool
+	Add(key K, value V) bool
 
 	// Get returns key's value from the cache
-	Get(key interface{}) (value interface{}, ok bool)
+	Get(key K) (value V, ok bool)
 }
 
-type cacheKey int64
+type mockCache[K string, V []byte] struct{}
 
-type mockCache struct{}
-
-func (c *mockCache) Add(_, _ interface{}) bool {
+func (c *mockCache[K, V]) Add(_ K, _ V) bool {
 	return false
 }
 
-func (c *mockCache) Get(_ interface{}) (interface{}, bool) {
-	return nil, false
+func (c *mockCache[K, V]) Get(_ K) (v V, evicted bool) {
+	return
 }

@@ -14,7 +14,11 @@ import (
 func main() {
 	var rs io.ReadSeeker
 	var err error
-	cli := ebsfile.New(ebsfile.Option{})
+	cli, err := ebsfile.New(ebsfile.Option{})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	rs, err = ebsfile.Open(os.Args[1], context.Background(), nil, cli)
 	if err != nil {
 		log.Fatal(err)
