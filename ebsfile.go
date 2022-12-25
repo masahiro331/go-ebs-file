@@ -160,11 +160,8 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	key := cacheKey(int64(index))
-	var buf []byte
-	bi, ok := f.cache.Get(key)
-	if ok {
-		buf = any(bi).([]byte)
-	} else {
+	buf, ok := f.cache.Get(key)
+	if !ok {
 		buf, err = f.read(index, token)
 		if err != nil {
 			return 0, err
