@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"os"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ebs"
 	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
+	"io"
+	"os"
+	"sync"
 )
 
 type MockEBS struct {
@@ -85,6 +85,7 @@ type File struct {
 	blockTable map[int32]string
 
 	ebsclient EBSAPI
+	syncMap   sync.Map
 	cache     Cache[string, []byte]
 	ctx       context.Context
 }
@@ -160,6 +161,12 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	key := cacheKey(int64(index))
+	mu := &sync.Mutex{}
+	v, ok := f.syncMap.LoadOrStore(key, mu)
+	mu = v.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
 	buf, ok := f.cache.Get(key)
 	if !ok {
 		buf, err = f.read(index, token)
