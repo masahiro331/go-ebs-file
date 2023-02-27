@@ -89,22 +89,13 @@ type File struct {
 	ctx       context.Context
 }
 
-type Option struct {
-	AwsSecretKey string
-	AwsAccessKey string
-	AwsRegion    string
-}
-
-func New(option Option) (*EBS, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+func New(ctx context.Context, optFns ...func(*config.LoadOptions) error) (*EBS, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, optFns...)
 	if err != nil {
 		return nil, err
 	}
-	if option.AwsRegion != "" {
-		cfg.Region = option.AwsRegion
-	}
-	ebsClient := ebs.NewFromConfig(cfg)
 
+	ebsClient := ebs.NewFromConfig(cfg)
 	return &EBS{ebsClient}, nil
 }
 
