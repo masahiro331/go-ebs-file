@@ -13,37 +13,85 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
 )
 
+var _ EBSAPI = (*MockEBS)(nil)
+
 type MockEBS struct {
 	EBSAPI
 
-	f          *os.File
+	Reader     io.ReaderAt
 	BlockSize  *int32
 	NextToken  *string
-	VolumeSize *int64
+	VolumeSize *int64          // volume size in bytes (unlike the real EBS API which returns GiB)
+	Allocated  map[int32]bool // nil means all blocks are allocated
+	PageSize   int            // 0 means all blocks in a single page (no pagination)
 }
 
-func (m MockEBS) WalkSnapshotBlocks(_ context.Context, _ *ebs.ListSnapshotBlocksInput, _ map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error) {
-	indexLen := *m.VolumeSize / int64(*m.BlockSize)
-	var blocks []types.Block
-	t := make(map[int32]string)
-	for i := int32(0); i < int32(indexLen); i++ {
-		blocks = append(blocks, types.Block{BlockIndex: aws.Int32(i)})
-		t[i] = ""
+func (m *MockEBS) ListSnapshotBlocks(_ context.Context, params *ebs.ListSnapshotBlocksInput, _ ...func(*ebs.Options)) (*ebs.ListSnapshotBlocksOutput, error) {
+	numBlocks := int32(*m.VolumeSize / int64(*m.BlockSize))
+
+	startIndex := int32(0)
+	if params.NextToken != nil {
+		if _, err := fmt.Sscanf(*params.NextToken, "token-%d", &startIndex); err != nil {
+			return nil, fmt.Errorf("invalid next token %q: %w", *params.NextToken, err)
+		}
 	}
 
-	return &ebs.ListSnapshotBlocksOutput{
+	pageSize := m.PageSize
+	if pageSize <= 0 {
+		pageSize = int(numBlocks)
+	}
+
+	var blocks []types.Block
+	count := 0
+	nextStart := int32(-1)
+	for i := startIndex; i < numBlocks; i++ {
+		if m.Allocated != nil && !m.Allocated[i] {
+			continue
+		}
+		if count >= pageSize {
+			nextStart = i
+			break
+		}
+		blocks = append(blocks, types.Block{
+			BlockIndex: aws.Int32(i),
+			BlockToken: aws.String(fmt.Sprintf("block-token-%d", i)),
+		})
+		count++
+	}
+
+	output := &ebs.ListSnapshotBlocksOutput{
 		Blocks:     blocks,
 		BlockSize:  m.BlockSize, // 512 KB
 		VolumeSize: m.VolumeSize,
-	}, t, nil
+	}
+	if nextStart >= 0 {
+		output.NextToken = aws.String(fmt.Sprintf("token-%d", nextStart))
+	}
+	return output, nil
 }
 
-func (m MockEBS) GetSnapshotBlock(_ context.Context, params *ebs.GetSnapshotBlockInput, optFns ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
+func (m *MockEBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error) {
+	output, err := m.ListSnapshotBlocks(ctx, input)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, block := range output.Blocks {
+		table[*block.BlockIndex] = *block.BlockToken
+	}
+	if output.NextToken != nil {
+		nextInput := *input
+		nextInput.NextToken = output.NextToken
+		return m.WalkSnapshotBlocks(ctx, &nextInput, table)
+	}
+	return output, table, nil
+}
+
+func (m *MockEBS) GetSnapshotBlock(_ context.Context, params *ebs.GetSnapshotBlockInput, _ ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
 	buf := make([]byte, *m.BlockSize)
 
-	offset := *params.BlockIndex * (*m.BlockSize)
-	n, err := m.f.ReadAt(buf, int64(offset))
-	if err != nil {
+	offset := int64(*params.BlockIndex) * int64(*m.BlockSize)
+	n, err := m.Reader.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	return &ebs.GetSnapshotBlockOutput{
@@ -58,11 +106,13 @@ func NewMockEBS(filePath string, blockSize int32, volumeSize int64) EBSAPI {
 		return nil
 	}
 	return &MockEBS{
-		f:          f,
+		Reader:     f,
 		BlockSize:  aws.Int32(blockSize),
 		VolumeSize: aws.Int64(volumeSize),
 	}
 }
+
+var _ EBSAPI = (*EBS)(nil)
 
 type EBS struct {
 	*ebs.Client
