@@ -21,7 +21,7 @@ type MockEBS struct {
 	Reader     io.ReaderAt
 	BlockSize  *int32
 	NextToken  *string
-	VolumeSize *int64          // volume size in bytes (unlike the real EBS API which returns GiB)
+	VolumeSize *int64         // volume size in bytes (unlike the real EBS API which returns GiB)
 	Allocated  map[int32]bool // nil means all blocks are allocated
 	PageSize   int            // 0 means all blocks in a single page (no pagination)
 }
