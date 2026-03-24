@@ -140,34 +140,56 @@ func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBS
 }
 
 func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
-	index, dataOffset := f.translateOffset(off)
-	token, ok := f.blockTable[index]
-	if !ok {
-		if f.blockSize-dataOffset < int32(len(p)) {
-			return int(f.blockSize - dataOffset), nil
-		} else {
-			return len(p), nil
-		}
+	if off < 0 {
+		return 0, fmt.Errorf("ebsfile: negative offset %d", off)
+	}
+	if off >= f.size {
+		return 0, io.EOF
 	}
 
-	key := cacheKey(int64(index))
-	buf, ok := f.cache.Get(key)
-	if !ok {
-		buf, err = f.read(index, token)
-		if err != nil {
-			return 0, err
+	for n < len(p) && off+int64(n) < f.size {
+		index, dataOffset := f.translateOffset(off + int64(n))
+		readable := int(f.blockSize - dataOffset)
+		remaining := len(p) - n
+		if readable > remaining {
+			readable = remaining
 		}
-		f.cache.Add(key, buf)
-	}
-	if len(buf) != int(f.blockSize) {
-		return 0, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
+		if volRemaining := int(f.size - off - int64(n)); readable > volRemaining {
+			readable = volRemaining
+		}
+
+		token, ok := f.blockTable[index]
+		if !ok {
+			// Blocks not in blockTable are unallocated in the EBS snapshot,
+			// which represent zero-filled disk regions.
+			for i := 0; i < readable; i++ {
+				p[n+i] = 0
+			}
+			n += readable
+			continue
+		}
+
+		key := cacheKey(int64(index))
+		buf, ok := f.cache.Get(key)
+		if !ok {
+			buf, err = f.read(index, token)
+			if err != nil {
+				return n, err
+			}
+			f.cache.Add(key, buf)
+		}
+		if len(buf) != int(f.blockSize) {
+			return n, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
+		}
+
+		copied := copy(p[n:], buf[dataOffset:dataOffset+int32(readable)])
+		n += copied
 	}
 
-	if f.blockSize-dataOffset < int32(len(p)) {
-		return copy(p, buf[dataOffset:]), nil
-	} else {
-		return copy(p, buf[dataOffset:dataOffset+int32(len(p))]), nil
+	if n < len(p) {
+		return n, io.EOF
 	}
+	return n, nil
 }
 
 func (f *File) Size() int64 {
@@ -191,11 +213,12 @@ func (f *File) read(index int32, token string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer o.BlockData.Close()
+
 	buf, err := io.ReadAll(o.BlockData)
 	if err != nil {
 		return nil, err
 	}
-	defer o.BlockData.Close()
 
 	return buf, nil
 }
