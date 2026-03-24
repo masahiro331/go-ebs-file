@@ -89,6 +89,11 @@ type File struct {
 	ctx       context.Context
 }
 
+// NewFromConfig creates a new EBS from an existing aws.Config.
+func NewFromConfig(cfg aws.Config, optFns ...func(*ebs.Options)) *EBS {
+	return &EBS{ebs.NewFromConfig(cfg, optFns...)}
+}
+
 func New(ctx context.Context, optFns ...func(*config.LoadOptions) error) (*EBS, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, optFns...)
 	if err != nil {
