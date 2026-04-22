@@ -13,37 +13,85 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
 )
 
+var _ EBSAPI = (*MockEBS)(nil)
+
 type MockEBS struct {
 	EBSAPI
 
-	f          *os.File
+	Reader     io.ReaderAt
 	BlockSize  *int32
 	NextToken  *string
-	VolumeSize *int64
+	VolumeSize *int64         // volume size in bytes (unlike the real EBS API which returns GiB)
+	Allocated  map[int32]bool // nil means all blocks are allocated
+	PageSize   int            // 0 means all blocks in a single page (no pagination)
 }
 
-func (m MockEBS) WalkSnapshotBlocks(_ context.Context, _ *ebs.ListSnapshotBlocksInput, _ map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error) {
-	indexLen := *m.VolumeSize / int64(*m.BlockSize)
-	var blocks []types.Block
-	t := make(map[int32]string)
-	for i := int32(0); i < int32(indexLen); i++ {
-		blocks = append(blocks, types.Block{BlockIndex: aws.Int32(i)})
-		t[i] = ""
+func (m *MockEBS) ListSnapshotBlocks(_ context.Context, params *ebs.ListSnapshotBlocksInput, _ ...func(*ebs.Options)) (*ebs.ListSnapshotBlocksOutput, error) {
+	numBlocks := int32(*m.VolumeSize / int64(*m.BlockSize))
+
+	startIndex := int32(0)
+	if params.NextToken != nil {
+		if _, err := fmt.Sscanf(*params.NextToken, "token-%d", &startIndex); err != nil {
+			return nil, fmt.Errorf("invalid next token %q: %w", *params.NextToken, err)
+		}
 	}
 
-	return &ebs.ListSnapshotBlocksOutput{
+	pageSize := m.PageSize
+	if pageSize <= 0 {
+		pageSize = int(numBlocks)
+	}
+
+	var blocks []types.Block
+	count := 0
+	nextStart := int32(-1)
+	for i := startIndex; i < numBlocks; i++ {
+		if m.Allocated != nil && !m.Allocated[i] {
+			continue
+		}
+		if count >= pageSize {
+			nextStart = i
+			break
+		}
+		blocks = append(blocks, types.Block{
+			BlockIndex: aws.Int32(i),
+			BlockToken: aws.String(fmt.Sprintf("block-token-%d", i)),
+		})
+		count++
+	}
+
+	output := &ebs.ListSnapshotBlocksOutput{
 		Blocks:     blocks,
 		BlockSize:  m.BlockSize, // 512 KB
 		VolumeSize: m.VolumeSize,
-	}, t, nil
+	}
+	if nextStart >= 0 {
+		output.NextToken = aws.String(fmt.Sprintf("token-%d", nextStart))
+	}
+	return output, nil
 }
 
-func (m MockEBS) GetSnapshotBlock(_ context.Context, params *ebs.GetSnapshotBlockInput, optFns ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
+func (m *MockEBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error) {
+	output, err := m.ListSnapshotBlocks(ctx, input)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, block := range output.Blocks {
+		table[*block.BlockIndex] = *block.BlockToken
+	}
+	if output.NextToken != nil {
+		nextInput := *input
+		nextInput.NextToken = output.NextToken
+		return m.WalkSnapshotBlocks(ctx, &nextInput, table)
+	}
+	return output, table, nil
+}
+
+func (m *MockEBS) GetSnapshotBlock(_ context.Context, params *ebs.GetSnapshotBlockInput, _ ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
 	buf := make([]byte, *m.BlockSize)
 
-	offset := *params.BlockIndex * (*m.BlockSize)
-	n, err := m.f.ReadAt(buf, int64(offset))
-	if err != nil {
+	offset := int64(*params.BlockIndex) * int64(*m.BlockSize)
+	n, err := m.Reader.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	return &ebs.GetSnapshotBlockOutput{
@@ -58,11 +106,13 @@ func NewMockEBS(filePath string, blockSize int32, volumeSize int64) EBSAPI {
 		return nil
 	}
 	return &MockEBS{
-		f:          f,
+		Reader:     f,
 		BlockSize:  aws.Int32(blockSize),
 		VolumeSize: aws.Int64(volumeSize),
 	}
 }
+
+var _ EBSAPI = (*EBS)(nil)
 
 type EBS struct {
 	*ebs.Client
@@ -145,34 +195,56 @@ func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBS
 }
 
 func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
-	index, dataOffset := f.translateOffset(off)
-	token, ok := f.blockTable[index]
-	if !ok {
-		if f.blockSize-dataOffset < int32(len(p)) {
-			return int(f.blockSize - dataOffset), nil
-		} else {
-			return len(p), nil
-		}
+	if off < 0 {
+		return 0, fmt.Errorf("ebsfile: negative offset %d", off)
+	}
+	if off >= f.size {
+		return 0, io.EOF
 	}
 
-	key := cacheKey(int64(index))
-	buf, ok := f.cache.Get(key)
-	if !ok {
-		buf, err = f.read(index, token)
-		if err != nil {
-			return 0, err
+	for n < len(p) && off+int64(n) < f.size {
+		index, dataOffset := f.translateOffset(off + int64(n))
+		readable := int(f.blockSize - dataOffset)
+		remaining := len(p) - n
+		if readable > remaining {
+			readable = remaining
 		}
-		f.cache.Add(key, buf)
-	}
-	if len(buf) != int(f.blockSize) {
-		return 0, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
+		if volRemaining := int(f.size - off - int64(n)); readable > volRemaining {
+			readable = volRemaining
+		}
+
+		token, ok := f.blockTable[index]
+		if !ok {
+			// Blocks not in blockTable are unallocated in the EBS snapshot,
+			// which represent zero-filled disk regions.
+			for i := 0; i < readable; i++ {
+				p[n+i] = 0
+			}
+			n += readable
+			continue
+		}
+
+		key := cacheKey(int64(index))
+		buf, ok := f.cache.Get(key)
+		if !ok {
+			buf, err = f.read(index, token)
+			if err != nil {
+				return n, err
+			}
+			f.cache.Add(key, buf)
+		}
+		if len(buf) != int(f.blockSize) {
+			return n, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
+		}
+
+		copied := copy(p[n:], buf[dataOffset:dataOffset+int32(readable)])
+		n += copied
 	}
 
-	if f.blockSize-dataOffset < int32(len(p)) {
-		return copy(p, buf[dataOffset:]), nil
-	} else {
-		return copy(p, buf[dataOffset:dataOffset+int32(len(p))]), nil
+	if n < len(p) {
+		return n, io.EOF
 	}
+	return n, nil
 }
 
 func (f *File) Size() int64 {
@@ -196,11 +268,12 @@ func (f *File) read(index int32, token string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer o.BlockData.Close()
+
 	buf, err := io.ReadAll(o.BlockData)
 	if err != nil {
 		return nil, err
 	}
-	defer o.BlockData.Close()
 
 	return buf, nil
 }
