@@ -54,3 +54,13 @@ func main() {
 }
 
 ```
+
+## Benchmarks
+
+The `ReadAt` benchmarks run against `MockEBS` with a simulated latency per
+request, so they need no AWS access. Besides time per operation, they report
+`requests/op`, the number of `GetSnapshotBlock` calls issued per `ReadAt`.
+
+```sh
+go test -run '^$' -bench 'BenchmarkReadAt' -benchmem -count 6
+```
