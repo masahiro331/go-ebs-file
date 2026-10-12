@@ -196,8 +196,9 @@ func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBS
 	return io.NewSectionReader(f, 0, f.Size()), nil
 }
 
-// ReadAt implements io.ReaderAt. It is safe for concurrent use: concurrent
-// reads of the same uncached block share a single GetSnapshotBlock request.
+// ReadAt implements io.ReaderAt. It is safe for concurrent use if the Cache
+// passed to Open is. Concurrent reads of the same uncached block share a
+// single GetSnapshotBlock request.
 func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	if off < 0 {
 		return 0, fmt.Errorf("ebsfile: negative offset %d", off)
