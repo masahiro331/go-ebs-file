@@ -416,7 +416,7 @@ func TestReadAt_SingleflightSameBlock(t *testing.T) {
 	}
 }
 
-func TestReadAt_SingleflightErrorIsSharedAndNotCached(t *testing.T) {
+func TestReadAt_FetchErrorIsReturnedAndNotCached(t *testing.T) {
 	errFetch := errors.New("fetch failed")
 	mock, data := newPatternMock(16, 1)
 	api := &countingEBS{
