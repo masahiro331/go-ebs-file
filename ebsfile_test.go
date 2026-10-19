@@ -472,6 +472,103 @@ func TestReadAt_ConcurrentReads(t *testing.T) {
 		data[i] = 0
 	}
 
+func newLatencyMock(latency time.Duration) *MockEBS {
+	const blockSize = int32(16)
+	return &MockEBS{
+		Reader:     bytes.NewReader(make([]byte, blockSize)),
+		BlockSize:  aws.Int32(blockSize),
+		VolumeSize: aws.Int64(int64(blockSize)),
+		Latency:    latency,
+	}
+}
+
+func TestMockEBS_GetSnapshotBlockCount(t *testing.T) {
+	mock := newLatencyMock(0)
+	params := &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)}
+
+	if got := mock.GetSnapshotBlockCount(); got != 0 {
+		t.Fatalf("initial count = %d, want 0", got)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := mock.GetSnapshotBlock(context.Background(), params); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := mock.GetSnapshotBlockCount(); got != 3 {
+		t.Fatalf("count = %d, want 3", got)
+	}
+}
+
+func TestMockEBS_GetSnapshotBlockCount_Concurrent(t *testing.T) {
+	mock := newLatencyMock(0)
+	params := &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)}
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := mock.GetSnapshotBlock(context.Background(), params); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := mock.GetSnapshotBlockCount(); got != goroutines {
+		t.Fatalf("count = %d, want %d", got, goroutines)
+	}
+}
+
+func TestMockEBS_Latency(t *testing.T) {
+	const latency = 50 * time.Millisecond
+	mock := newLatencyMock(latency)
+
+	start := time.Now()
+	if _, err := mock.ListSnapshotBlocks(context.Background(), &ebs.ListSnapshotBlocksInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < latency {
+		t.Errorf("ListSnapshotBlocks took %v, want at least %v", elapsed, latency)
+	}
+
+	start = time.Now()
+	params := &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)}
+	if _, err := mock.GetSnapshotBlock(context.Background(), params); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < latency {
+		t.Errorf("GetSnapshotBlock took %v, want at least %v", elapsed, latency)
+	}
+}
+
+func TestMockEBS_LatencyUnset(t *testing.T) {
+	mock := newLatencyMock(0)
+	params := &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)}
+
+	start := time.Now()
+	if _, err := mock.GetSnapshotBlock(context.Background(), params); err != nil {
+		t.Fatal(err)
+	}
+	// Loose bound so that GC or scheduler pauses under -race cannot fail the test.
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("GetSnapshotBlock took %v, want no delay", elapsed)
+	}
+}
+
+func TestMockEBS_GetSnapshotBlockCount_ReadAt(t *testing.T) {
+	blockSize := int32(16)
+	numBlocks := int32(4)
+	mock := &MockEBS{
+		Reader:     bytes.NewReader(make([]byte, blockSize*numBlocks)),
+		BlockSize:  aws.Int32(blockSize),
+		VolumeSize: aws.Int64(int64(blockSize * numBlocks)),
+		Allocated:  map[int32]bool{0: true, 1: true, 3: true}, // block 2 is unallocated
+		Latency:    time.Millisecond,
+	}
+
+	// A nil cache never hits, so every allocated block is fetched.
 	sr, err := Open("snap-test", context.Background(), nil, mock)
 	if err != nil {
 		t.Fatal(err)
@@ -525,4 +622,50 @@ func BenchmarkReadAt_ConcurrentSameBlock(b *testing.B) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(api.calls.Load())/float64(b.N), "requests/op")
+	buf := make([]byte, blockSize*numBlocks)
+	if _, err := sr.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.GetSnapshotBlockCount(); got != 3 {
+		t.Fatalf("count = %d, want 3", got)
+	}
+}
+
+func TestMockEBS_ContextCanceledBeforeCall(t *testing.T) {
+	// Latency is unset: the context is checked even without a delay.
+	mock := newLatencyMock(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	params := &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)}
+	if _, err := mock.GetSnapshotBlock(ctx, params); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetSnapshotBlock error = %v, want context.Canceled", err)
+	}
+	if _, err := mock.ListSnapshotBlocks(ctx, &ebs.ListSnapshotBlocksInput{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListSnapshotBlocks error = %v, want context.Canceled", err)
+	}
+
+	// The call was issued, so it is counted even though it failed.
+	if got := mock.GetSnapshotBlockCount(); got != 1 {
+		t.Fatalf("count = %d, want 1", got)
+	}
+}
+
+func TestMockEBS_ContextCanceledDuringLatency(t *testing.T) {
+	mock := newLatencyMock(30 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	start := time.Now()
+	params := &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)}
+	if _, err := mock.GetSnapshotBlock(ctx, params); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetSnapshotBlock error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed >= mock.Latency {
+		t.Errorf("GetSnapshotBlock took %v, want it to abort well before %v", elapsed, mock.Latency)
+	}
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -25,9 +27,34 @@ type MockEBS struct {
 	VolumeSize *int64         // volume size in bytes (unlike the real EBS API which returns GiB)
 	Allocated  map[int32]bool // nil means all blocks are allocated
 	PageSize   int            // 0 means all blocks in a single page (no pagination)
+	Latency    time.Duration  // delay added to each ListSnapshotBlocks and GetSnapshotBlock call
+
+	getSnapshotBlockCalls atomic.Int64
 }
 
-func (m *MockEBS) ListSnapshotBlocks(_ context.Context, params *ebs.ListSnapshotBlocksInput, _ ...func(*ebs.Options)) (*ebs.ListSnapshotBlocksOutput, error) {
+func (m *MockEBS) wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.Latency <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(m.Latency)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *MockEBS) ListSnapshotBlocks(ctx context.Context, params *ebs.ListSnapshotBlocksInput, _ ...func(*ebs.Options)) (*ebs.ListSnapshotBlocksOutput, error) {
+	if err := m.wait(ctx); err != nil {
+		return nil, err
+	}
+
 	numBlocks := int32(*m.VolumeSize / int64(*m.BlockSize))
 
 	startIndex := int32(0)
@@ -87,7 +114,12 @@ func (m *MockEBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapsho
 	return output, table, nil
 }
 
-func (m *MockEBS) GetSnapshotBlock(_ context.Context, params *ebs.GetSnapshotBlockInput, _ ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
+func (m *MockEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnapshotBlockInput, _ ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
+	m.getSnapshotBlockCalls.Add(1)
+	if err := m.wait(ctx); err != nil {
+		return nil, err
+	}
+
 	buf := make([]byte, *m.BlockSize)
 
 	offset := int64(*params.BlockIndex) * int64(*m.BlockSize)
@@ -99,6 +131,11 @@ func (m *MockEBS) GetSnapshotBlock(_ context.Context, params *ebs.GetSnapshotBlo
 		BlockData:  io.NopCloser(bytes.NewReader(buf)),
 		DataLength: aws.Int32(int32(n)),
 	}, nil
+}
+
+// GetSnapshotBlockCount returns the number of GetSnapshotBlock calls, including failed ones.
+func (m *MockEBS) GetSnapshotBlockCount() int64 {
+	return m.getSnapshotBlockCalls.Load()
 }
 
 func NewMockEBS(filePath string, blockSize int32, volumeSize int64) EBSAPI {
