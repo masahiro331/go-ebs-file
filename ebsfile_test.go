@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -292,6 +293,185 @@ func TestReadAt_EOF(t *testing.T) {
 	}
 }
 
+// countingEBS counts GetSnapshotBlock calls. If release is set, each call
+// signals entered and blocks until release is closed.
+type countingEBS struct {
+	EBSAPI
+
+	calls   atomic.Int64
+	entered chan struct{}
+	release chan struct{}
+	err     error
+	latency time.Duration
+}
+
+func (c *countingEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnapshotBlockInput, optFns ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
+	c.calls.Add(1)
+	if c.entered != nil {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+	}
+	if c.release != nil {
+		<-c.release
+	}
+	if c.latency > 0 {
+		time.Sleep(c.latency)
+	}
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.EBSAPI.GetSnapshotBlock(ctx, params, optFns...)
+}
+
+type mapCache struct {
+	mu     sync.Mutex
+	values map[string][]byte
+}
+
+func newMapCache() *mapCache {
+	return &mapCache{values: make(map[string][]byte)}
+}
+
+func (c *mapCache) Add(key string, value []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.values[key] = value
+	return true
+}
+
+func (c *mapCache) Get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value, ok := c.values[key]
+	return value, ok
+}
+
+// newPatternMock fills each offset with a distinct-enough byte so that data
+// copied to the wrong place is detected.
+func newPatternMock(blockSize, numBlocks int32) (*MockEBS, []byte) {
+	data := make([]byte, int(blockSize)*int(numBlocks))
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	return &MockEBS{
+		Reader:     bytes.NewReader(data),
+		BlockSize:  aws.Int32(blockSize),
+		VolumeSize: aws.Int64(int64(len(data))),
+	}, data
+}
+
+// waitForFetch releases the in-flight fetch after giving the other goroutines
+// time to request the same block; without coalescing, each would fetch it.
+func waitForFetch(t *testing.T, api *countingEBS) {
+	t.Helper()
+	select {
+	case <-api.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetSnapshotBlock was not called")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(api.release)
+}
+
+func TestReadAt_SingleflightSameBlock(t *testing.T) {
+	mock, data := newPatternMock(16, 2)
+	api := &countingEBS{
+		EBSAPI:  mock,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	sr, err := Open("snap-test", context.Background(), newMapCache(), api)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 4)
+			if _, err := sr.ReadAt(buf, 2); err != nil {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(buf, data[2:6]) {
+				errs <- errors.New("ReadAt returned wrong data")
+			}
+		}()
+	}
+	waitForFetch(t, api)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	if got := api.calls.Load(); got != 1 {
+		t.Fatalf("GetSnapshotBlock calls = %d, want 1", got)
+	}
+}
+
+func TestReadAt_FetchErrorIsReturnedAndNotCached(t *testing.T) {
+	errFetch := errors.New("fetch failed")
+	mock, data := newPatternMock(16, 1)
+	api := &countingEBS{
+		EBSAPI:  mock,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		err:     errFetch,
+	}
+	sr, err := Open("snap-test", context.Background(), newMapCache(), api)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := sr.ReadAt(make([]byte, 4), 0)
+			errs <- err
+		}()
+	}
+	waitForFetch(t, api)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if !errors.Is(err, errFetch) {
+			t.Errorf("ReadAt error = %v, want %v", err, errFetch)
+		}
+	}
+
+	api.err = nil
+	callsBefore := api.calls.Load()
+	buf := make([]byte, 4)
+	if _, err := sr.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt after recovery: %v", err)
+	}
+	if !bytes.Equal(buf, data[0:4]) {
+		t.Fatalf("ReadAt after recovery = %v, want %v", buf, data[0:4])
+	}
+	if got := api.calls.Load() - callsBefore; got != 1 {
+		t.Fatalf("GetSnapshotBlock calls after recovery = %d, want 1", got)
+	}
+}
+
+func TestReadAt_ConcurrentReads(t *testing.T) {
+	const blockSize, numBlocks = int32(16), int32(8)
+	mock, data := newPatternMock(blockSize, numBlocks)
+	mock.Allocated = map[int32]bool{0: true, 1: true, 2: true, 4: true, 5: true, 6: true, 7: true} // block 3 is unallocated
+	for i := 3 * int(blockSize); i < 4*int(blockSize); i++ {
+		data[i] = 0
+	}
+
 func newLatencyMock(latency time.Duration) *MockEBS {
 	const blockSize = int32(16)
 	return &MockEBS{
@@ -394,6 +574,54 @@ func TestMockEBS_GetSnapshotBlockCount_ReadAt(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			off := int64((i * 7) % (len(data) - 24))
+			buf := make([]byte, 24)
+			n, err := sr.ReadAt(buf, off)
+			if err != nil || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(len(buf))]) {
+				t.Errorf("ReadAt(%d): n=%d err=%v", off, n, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// BenchmarkReadAt_ConcurrentSameBlock reports GetSnapshotBlock calls per round
+// of 8 goroutines reading the same uncached block.
+func BenchmarkReadAt_ConcurrentSameBlock(b *testing.B) {
+	const goroutines = 8
+	mock, _ := newPatternMock(512*1024, 1)
+	api := &countingEBS{EBSAPI: mock, latency: 100 * time.Microsecond}
+	sr, err := Open("benchmark-snapshot", context.Background(), nil, api)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	bufs := make([][]byte, goroutines)
+	for i := range bufs {
+		bufs[i] = make([]byte, 4*1024)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var wg sync.WaitGroup
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func(buf []byte) {
+				defer wg.Done()
+				if _, err := sr.ReadAt(buf, 0); err != nil {
+					b.Error(err)
+				}
+			}(bufs[g])
+		}
+		wg.Wait()
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(api.calls.Load())/float64(b.N), "requests/op")
 	buf := make([]byte, blockSize*numBlocks)
 	if _, err := sr.ReadAt(buf, 0); err != nil {
 		t.Fatal(err)

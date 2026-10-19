@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ebs"
 	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
+	"golang.org/x/sync/singleflight"
 )
 
 var _ EBSAPI = (*MockEBS)(nil)
@@ -174,6 +175,7 @@ type File struct {
 	ebsclient EBSAPI
 	cache     Cache[string, []byte]
 	ctx       context.Context
+	group     singleflight.Group
 }
 
 // NewFromConfig creates a new EBS from an existing aws.Config.
@@ -231,6 +233,9 @@ func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBS
 	return io.NewSectionReader(f, 0, f.Size()), nil
 }
 
+// ReadAt implements io.ReaderAt. It is safe for concurrent use if the Cache
+// passed to Open is. Concurrent reads of the same uncached block share a
+// single GetSnapshotBlock request.
 func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	if off < 0 {
 		return 0, fmt.Errorf("ebsfile: negative offset %d", off)
@@ -261,14 +266,10 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 			continue
 		}
 
-		key := cacheKey(int64(index))
-		buf, ok := f.cache.Get(key)
-		if !ok {
-			buf, err = f.read(index, token)
-			if err != nil {
-				return n, err
-			}
-			f.cache.Add(key, buf)
+		var buf []byte
+		buf, err = f.loadBlock(index, token)
+		if err != nil {
+			return n, err
 		}
 		if len(buf) != int(f.blockSize) {
 			return n, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
@@ -282,6 +283,31 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+// loadBlock returns the block at index, coalescing concurrent fetches of it.
+func (f *File) loadBlock(index int32, token string) ([]byte, error) {
+	key := cacheKey(int64(index))
+	if buf, ok := f.cache.Get(key); ok {
+		return buf, nil
+	}
+
+	v, err, _ := f.group.Do(key, func() (any, error) {
+		// Another fetch may have cached the block since the Get above.
+		if buf, ok := f.cache.Get(key); ok {
+			return buf, nil
+		}
+		buf, err := f.read(index, token)
+		if err != nil {
+			return nil, err
+		}
+		f.cache.Add(key, buf)
+		return buf, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]byte), nil
 }
 
 func (f *File) Size() int64 {
