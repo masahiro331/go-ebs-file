@@ -472,6 +472,61 @@ func TestReadAt_ConcurrentReads(t *testing.T) {
 		data[i] = 0
 	}
 
+	sr, err := Open("snap-test", context.Background(), nil, mock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			off := int64((i * 7) % (len(data) - 24))
+			buf := make([]byte, 24)
+			n, err := sr.ReadAt(buf, off)
+			if err != nil || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(len(buf))]) {
+				t.Errorf("ReadAt(%d): n=%d err=%v", off, n, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// BenchmarkReadAt_ConcurrentSameBlock reports GetSnapshotBlock calls per round
+// of 8 goroutines reading the same uncached block.
+func BenchmarkReadAt_ConcurrentSameBlock(b *testing.B) {
+	const goroutines = 8
+	mock, _ := newPatternMock(512*1024, 1)
+	api := &countingEBS{EBSAPI: mock, latency: 100 * time.Microsecond}
+	sr, err := Open("benchmark-snapshot", context.Background(), nil, api)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	bufs := make([][]byte, goroutines)
+	for i := range bufs {
+		bufs[i] = make([]byte, 4*1024)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var wg sync.WaitGroup
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func(buf []byte) {
+				defer wg.Done()
+				if _, err := sr.ReadAt(buf, 0); err != nil {
+					b.Error(err)
+				}
+			}(bufs[g])
+		}
+		wg.Wait()
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(api.calls.Load())/float64(b.N), "requests/op")
+}
+
 func newLatencyMock(latency time.Duration) *MockEBS {
 	const blockSize = int32(16)
 	return &MockEBS{
@@ -574,54 +629,6 @@ func TestMockEBS_GetSnapshotBlockCount_ReadAt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	for i := 0; i < 64; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			off := int64((i * 7) % (len(data) - 24))
-			buf := make([]byte, 24)
-			n, err := sr.ReadAt(buf, off)
-			if err != nil || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(len(buf))]) {
-				t.Errorf("ReadAt(%d): n=%d err=%v", off, n, err)
-			}
-		}(i)
-	}
-	wg.Wait()
-}
-
-// BenchmarkReadAt_ConcurrentSameBlock reports GetSnapshotBlock calls per round
-// of 8 goroutines reading the same uncached block.
-func BenchmarkReadAt_ConcurrentSameBlock(b *testing.B) {
-	const goroutines = 8
-	mock, _ := newPatternMock(512*1024, 1)
-	api := &countingEBS{EBSAPI: mock, latency: 100 * time.Microsecond}
-	sr, err := Open("benchmark-snapshot", context.Background(), nil, api)
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	bufs := make([][]byte, goroutines)
-	for i := range bufs {
-		bufs[i] = make([]byte, 4*1024)
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		var wg sync.WaitGroup
-		for g := 0; g < goroutines; g++ {
-			wg.Add(1)
-			go func(buf []byte) {
-				defer wg.Done()
-				if _, err := sr.ReadAt(buf, 0); err != nil {
-					b.Error(err)
-				}
-			}(bufs[g])
-		}
-		wg.Wait()
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(api.calls.Load())/float64(b.N), "requests/op")
 	buf := make([]byte, blockSize*numBlocks)
 	if _, err := sr.ReadAt(buf, 0); err != nil {
 		t.Fatal(err)
