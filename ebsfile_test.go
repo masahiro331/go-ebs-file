@@ -3,15 +3,20 @@ package ebsfile
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ebs"
+	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
 )
 
 func TestWalkSnapshotBlocks_Pagination(t *testing.T) {
@@ -294,7 +299,8 @@ func TestReadAt_EOF(t *testing.T) {
 }
 
 // countingEBS counts GetSnapshotBlock calls. If release is set, each call
-// signals entered and blocks until release is closed.
+// signals entered and blocks until release is closed. If mutate is set, it
+// can change the output of each call; call is 1 for the first call.
 type countingEBS struct {
 	EBSAPI
 
@@ -303,10 +309,11 @@ type countingEBS struct {
 	release chan struct{}
 	err     error
 	latency time.Duration
+	mutate  func(call int64, out *ebs.GetSnapshotBlockOutput)
 }
 
 func (c *countingEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnapshotBlockInput, optFns ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
-	c.calls.Add(1)
+	call := c.calls.Add(1)
 	if c.entered != nil {
 		select {
 		case c.entered <- struct{}{}:
@@ -322,7 +329,11 @@ func (c *countingEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnaps
 	if c.err != nil {
 		return nil, c.err
 	}
-	return c.EBSAPI.GetSnapshotBlock(ctx, params, optFns...)
+	out, err := c.EBSAPI.GetSnapshotBlock(ctx, params, optFns...)
+	if err == nil && c.mutate != nil {
+		c.mutate(call, out)
+	}
+	return out, err
 }
 
 type mapCache struct {
@@ -369,6 +380,7 @@ func waitForFetch(t *testing.T, api *countingEBS) {
 	select {
 	case <-api.entered:
 	case <-time.After(5 * time.Second):
+		close(api.release)
 		t.Fatal("GetSnapshotBlock was not called")
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -667,5 +679,182 @@ func TestMockEBS_ContextCanceledDuringLatency(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed >= mock.Latency {
 		t.Errorf("GetSnapshotBlock took %v, want it to abort well before %v", elapsed, mock.Latency)
+	}
+}
+
+func newChecksumFixture(t *testing.T, mutate func(int64, *ebs.GetSnapshotBlockOutput), options OpenOptions) (*countingEBS, *io.SectionReader, []byte) {
+	t.Helper()
+	mock, data := newPatternMock(16, 1)
+	api := &countingEBS{EBSAPI: mock, mutate: mutate}
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), api, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api, sr, data
+}
+
+// corruptBody flips a byte of the block data and keeps the original checksum.
+func corruptBody(out *ebs.GetSnapshotBlockOutput) {
+	body, _ := io.ReadAll(out.BlockData)
+	body[0] ^= 0xFF
+	out.BlockData = io.NopCloser(bytes.NewReader(body))
+}
+
+func TestMockEBS_GetSnapshotBlockReturnsChecksum(t *testing.T) {
+	mock, _ := newPatternMock(16, 1)
+	out, err := mock.GetSnapshotBlock(context.Background(), &ebs.GetSnapshotBlockInput{BlockIndex: aws.Int32(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(out.BlockData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	if out.ChecksumAlgorithm != types.ChecksumAlgorithmChecksumAlgorithmSha256 {
+		t.Errorf("ChecksumAlgorithm = %q, want SHA256", out.ChecksumAlgorithm)
+	}
+	if got, want := aws.ToString(out.Checksum), base64.StdEncoding.EncodeToString(sum[:]); got != want {
+		t.Errorf("Checksum = %q, want %q", got, want)
+	}
+}
+
+func TestReadAt_ChecksumMismatchIsRefetched(t *testing.T) {
+	api, sr, data := newChecksumFixture(t, func(call int64, out *ebs.GetSnapshotBlockOutput) {
+		if call == 1 {
+			corruptBody(out)
+		}
+	}, OpenOptions{})
+
+	buf := make([]byte, 4)
+	if _, err := sr.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, data[:4]) {
+		t.Errorf("ReadAt = %v, want %v", buf, data[:4])
+	}
+	if got := api.calls.Load(); got != 2 {
+		t.Errorf("GetSnapshotBlock calls = %d, want 2", got)
+	}
+}
+
+func TestReadAt_PersistentChecksumMismatchIsNotCached(t *testing.T) {
+	var corrupt atomic.Bool
+	corrupt.Store(true)
+	api, sr, data := newChecksumFixture(t, func(_ int64, out *ebs.GetSnapshotBlockOutput) {
+		if corrupt.Load() {
+			corruptBody(out)
+		}
+	}, OpenOptions{})
+
+	if _, err := sr.ReadAt(make([]byte, 4), 0); !errors.Is(err, errChecksumMismatch) {
+		t.Fatalf("ReadAt error = %v, want %v", err, errChecksumMismatch)
+	}
+	if got := api.calls.Load(); got != DefaultBlockFetchAttempts {
+		t.Fatalf("GetSnapshotBlock calls = %d, want %d", got, DefaultBlockFetchAttempts)
+	}
+
+	corrupt.Store(false)
+	buf := make([]byte, 4)
+	if _, err := sr.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt after recovery: %v", err)
+	}
+	if !bytes.Equal(buf, data[:4]) {
+		t.Errorf("ReadAt after recovery = %v, want %v", buf, data[:4])
+	}
+	if got := api.calls.Load(); got != DefaultBlockFetchAttempts+1 {
+		t.Errorf("GetSnapshotBlock calls = %d, want %d", got, DefaultBlockFetchAttempts+1)
+	}
+}
+
+func TestReadAt_BlockFetchAttemptsOneDisablesRefetch(t *testing.T) {
+	api, sr, _ := newChecksumFixture(t, func(_ int64, out *ebs.GetSnapshotBlockOutput) {
+		corruptBody(out)
+	}, OpenOptions{BlockFetchAttempts: 1})
+
+	if _, err := sr.ReadAt(make([]byte, 4), 0); !errors.Is(err, errChecksumMismatch) {
+		t.Fatalf("ReadAt error = %v, want %v", err, errChecksumMismatch)
+	}
+	if got := api.calls.Load(); got != 1 {
+		t.Errorf("GetSnapshotBlock calls = %d, want 1", got)
+	}
+}
+
+func TestReadAt_MissingChecksum(t *testing.T) {
+	removeChecksum := func(_ int64, out *ebs.GetSnapshotBlockOutput) {
+		out.Checksum = nil
+	}
+
+	t.Run("is an error by default", func(t *testing.T) {
+		api, sr, _ := newChecksumFixture(t, removeChecksum, OpenOptions{})
+		if _, err := sr.ReadAt(make([]byte, 4), 0); !errors.Is(err, errMissingChecksum) {
+			t.Fatalf("ReadAt error = %v, want %v", err, errMissingChecksum)
+		}
+		if got := api.calls.Load(); got != 1 {
+			t.Errorf("GetSnapshotBlock calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("is accepted with AllowMissingChecksum", func(t *testing.T) {
+		api, sr, data := newChecksumFixture(t, removeChecksum, OpenOptions{AllowMissingChecksum: true})
+		buf := make([]byte, 4)
+		if _, err := sr.ReadAt(buf, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(buf, data[:4]) {
+			t.Errorf("ReadAt = %v, want %v", buf, data[:4])
+		}
+		if got := api.calls.Load(); got != 1 {
+			t.Errorf("GetSnapshotBlock calls = %d, want 1", got)
+		}
+	})
+}
+
+func TestReadAt_UnsupportedChecksumAlgorithm(t *testing.T) {
+	api, sr, _ := newChecksumFixture(t, func(_ int64, out *ebs.GetSnapshotBlockOutput) {
+		out.ChecksumAlgorithm = "MD5"
+	}, OpenOptions{AllowMissingChecksum: true})
+
+	_, err := sr.ReadAt(make([]byte, 4), 0)
+	if err == nil || !strings.Contains(err.Error(), "unsupported checksum algorithm") {
+		t.Fatalf("ReadAt error = %v, want unsupported checksum algorithm", err)
+	}
+	if got := api.calls.Load(); got != 1 {
+		t.Errorf("GetSnapshotBlock calls = %d, want 1", got)
+	}
+}
+
+func TestReadAt_BodyReadErrorIsRefetched(t *testing.T) {
+	api, sr, data := newChecksumFixture(t, func(call int64, out *ebs.GetSnapshotBlockOutput) {
+		if call == 1 {
+			body, _ := io.ReadAll(out.BlockData)
+			out.BlockData = io.NopCloser(io.MultiReader(bytes.NewReader(body[:8]), iotest.ErrReader(errors.New("connection reset"))))
+		}
+	}, OpenOptions{})
+
+	buf := make([]byte, 4)
+	if _, err := sr.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, data[:4]) {
+		t.Errorf("ReadAt = %v, want %v", buf, data[:4])
+	}
+	if got := api.calls.Load(); got != 2 {
+		t.Errorf("GetSnapshotBlock calls = %d, want 2", got)
+	}
+}
+
+func TestReadAt_ShortBodyIsRefetchedThenFails(t *testing.T) {
+	api, sr, _ := newChecksumFixture(t, func(_ int64, out *ebs.GetSnapshotBlockOutput) {
+		body, _ := io.ReadAll(out.BlockData)
+		out.BlockData = io.NopCloser(bytes.NewReader(body[:8]))
+	}, OpenOptions{})
+
+	_, err := sr.ReadAt(make([]byte, 4), 0)
+	if err == nil || !strings.Contains(err.Error(), "invalid block size") {
+		t.Fatalf("ReadAt error = %v, want invalid block size", err)
+	}
+	if got := api.calls.Load(); got != DefaultBlockFetchAttempts {
+		t.Errorf("GetSnapshotBlock calls = %d, want %d", got, DefaultBlockFetchAttempts)
 	}
 }

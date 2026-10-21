@@ -3,6 +3,9 @@ package ebsfile
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -127,9 +130,12 @@ func (m *MockEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnapshotB
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
+	sum := sha256.Sum256(buf)
 	return &ebs.GetSnapshotBlockOutput{
-		BlockData:  io.NopCloser(bytes.NewReader(buf)),
-		DataLength: aws.Int32(int32(n)),
+		BlockData:         io.NopCloser(bytes.NewReader(buf)),
+		DataLength:        aws.Int32(int32(n)),
+		Checksum:          aws.String(base64.StdEncoding.EncodeToString(sum[:])),
+		ChecksumAlgorithm: types.ChecksumAlgorithmChecksumAlgorithmSha256,
 	}, nil
 }
 
@@ -176,7 +182,35 @@ type File struct {
 	cache     Cache[string, []byte]
 	ctx       context.Context
 	group     singleflight.Group
+
+	allowMissingChecksum bool
+	fetchAttempts        int
 }
+
+// DefaultBlockFetchAttempts is the number of times a block is fetched when its
+// body cannot be read or verified, unless OpenOptions.BlockFetchAttempts is set.
+const DefaultBlockFetchAttempts = 2
+
+// OpenOptions configures OpenWithOptions. The zero value gives the behavior of
+// Open.
+type OpenOptions struct {
+	// AllowMissingChecksum accepts GetSnapshotBlock responses without a
+	// checksum. By default such a response is an error. A checksum that does
+	// not match the block data is an error regardless of this option.
+	AllowMissingChecksum bool
+
+	// BlockFetchAttempts is the maximum number of GetSnapshotBlock calls for a
+	// block whose body fails to read, has the wrong length, or does not match
+	// its checksum. 1 disables refetching, and a non-positive value uses
+	// DefaultBlockFetchAttempts. Errors returned by GetSnapshotBlock itself are
+	// not refetched, because the AWS SDK has already retried them.
+	BlockFetchAttempts int
+}
+
+var (
+	errMissingChecksum  = errors.New("response has no checksum; set OpenOptions.AllowMissingChecksum to accept it")
+	errChecksumMismatch = errors.New("checksum mismatch")
+)
 
 // NewFromConfig creates a new EBS from an existing aws.Config.
 func NewFromConfig(cfg aws.Config, optFns ...func(*ebs.Options)) *EBS {
@@ -210,6 +244,16 @@ func (e EBS) WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBloc
 }
 
 func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBSAPI) (*io.SectionReader, error) {
+	return OpenWithOptions(snapID, ctx, cache, e, OpenOptions{})
+}
+
+// OpenWithOptions is Open with options. Each block read from the snapshot is
+// verified against the SHA256 checksum returned by GetSnapshotBlock before it
+// is cached.
+func OpenWithOptions(snapID string, ctx context.Context, cache Cache[string, []byte], e EBSAPI, options OpenOptions) (*io.SectionReader, error) {
+	if options.BlockFetchAttempts <= 0 {
+		options.BlockFetchAttempts = DefaultBlockFetchAttempts
+	}
 	input := &ebs.ListSnapshotBlocksInput{
 		SnapshotId: &snapID,
 	}
@@ -229,6 +273,9 @@ func Open(snapID string, ctx context.Context, cache Cache[string, []byte], e EBS
 		cache:      cache,
 		ebsclient:  e,
 		ctx:        ctx,
+
+		allowMissingChecksum: options.AllowMissingChecksum,
+		fetchAttempts:        options.BlockFetchAttempts,
 	}
 	return io.NewSectionReader(f, 0, f.Size()), nil
 }
@@ -322,6 +369,24 @@ func (f *File) translateOffset(offset int64) (int32, int32) {
 }
 
 func (f *File) read(index int32, token string) ([]byte, error) {
+	for attempt := 1; ; attempt++ {
+		buf, retryable, err := f.fetchBlock(index, token)
+		if err == nil {
+			return buf, nil
+		}
+		if !retryable || attempt >= f.fetchAttempts || f.ctx.Err() != nil {
+			if attempt > 1 {
+				return nil, fmt.Errorf("ebsfile: block %d after %d attempts: %w", index, attempt, err)
+			}
+			return nil, fmt.Errorf("ebsfile: block %d: %w", index, err)
+		}
+	}
+}
+
+// fetchBlock fetches and verifies one block. It reports whether the failure
+// may go away on another fetch. A missing checksum or an unsupported algorithm
+// will not, so they are not retryable.
+func (f *File) fetchBlock(index int32, token string) (buf []byte, retryable bool, err error) {
 	input := &ebs.GetSnapshotBlockInput{
 		SnapshotId: &f.snapshotID,
 		BlockIndex: &index,
@@ -329,14 +394,31 @@ func (f *File) read(index int32, token string) ([]byte, error) {
 	}
 	o, err := f.ebsclient.GetSnapshotBlock(f.ctx, input)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer o.BlockData.Close()
 
-	buf, err := io.ReadAll(o.BlockData)
+	buf, err = io.ReadAll(o.BlockData)
 	if err != nil {
-		return nil, err
+		return nil, true, err
+	}
+	if len(buf) != int(f.blockSize) {
+		return nil, true, fmt.Errorf("invalid block size: got %d bytes, want %d", len(buf), f.blockSize)
 	}
 
-	return buf, nil
+	checksum := aws.ToString(o.Checksum)
+	if checksum == "" {
+		if f.allowMissingChecksum {
+			return buf, false, nil
+		}
+		return nil, false, errMissingChecksum
+	}
+	if o.ChecksumAlgorithm != types.ChecksumAlgorithmChecksumAlgorithmSha256 {
+		return nil, false, fmt.Errorf("unsupported checksum algorithm %q", o.ChecksumAlgorithm)
+	}
+	sum := sha256.Sum256(buf)
+	if base64.StdEncoding.EncodeToString(sum[:]) != checksum {
+		return nil, true, errChecksumMismatch
+	}
+	return buf, false, nil
 }
